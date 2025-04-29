@@ -5,6 +5,7 @@ Addressing this need, we present Unitxt, an innovative library for customizable 
 """
 
 import importlib.util
+import json
 import re
 from collections.abc import Callable
 from functools import partial
@@ -44,17 +45,6 @@ def assert_unitxt_installed():
         )
 
 
-def score(items, metric):
-    predictions, references = zip(*items)
-    assert_unitxt_installed()
-    from unitxt import evaluate
-
-    for reference in references:
-        reference["metrics"] = [metric]
-    results = evaluate(predictions, references)
-    return results[0]["score"]["global"]["score"]
-
-
 class Unitxt(ConfigurableTask):
     VERSION = 0
 
@@ -65,12 +55,13 @@ class Unitxt(ConfigurableTask):
         if config is None:
             config = {}
         assert "recipe" in config, "Unitxt task must have a 'recipe' string."
-        super().__init__(
-            config={
-                "metadata": {"version": self.VERSION},
-                "dataset_name": config["recipe"],
-            }
-        )
+
+        unitxt_config = {
+            "metadata": {"version": self.VERSION},
+            "dataset_name": config["recipe"],
+        }
+
+        super().__init__(config=unitxt_config)
         self.image_decoder = datasets.Image()
         self.metrics = self.dataset["test"][0]["metrics"]
 
@@ -176,6 +167,18 @@ class Unitxt(ConfigurableTask):
             for metric in self.metrics
         }
 
+    def score(self, items, metric):
+        predictions, references = zip(*items)
+        assert_unitxt_installed()
+        from unitxt import evaluate
+
+        for reference in references:
+            reference["metrics"] = [metric]
+
+        results = evaluate(predictions, references)
+
+        return results[0]["score"]["global"]["score"]
+
     def aggregation(self):
         """
         :returns: {str: [float] -> float}
@@ -183,7 +186,7 @@ class Unitxt(ConfigurableTask):
             functions that aggregate a list of metrics
         """
         return {
-            metric.replace("metrics.", ""): partial(score, metric=metric)
+            metric.replace("metrics.", ""): partial(self.score, metric=metric)
             for metric in self.metrics
         }
 
@@ -225,3 +228,72 @@ class UnitxtMultiModal(Unitxt):
 
     def get_arguments(self, doc, ctx):
         return (ctx, {"until": ["\n"]}, {"visual": self.doc_to_image(doc)})
+
+
+class UnitxtRAG(Unitxt):
+    def __init__(
+        self,
+        config: Optional[dict] = None,
+    ) -> None:
+        if config is None:
+            config = {}
+
+        assert config.get("rag"), "Not a RAG task"
+        # import MCP library
+
+        # parse args to get values
+        # client_args = {"endpoint": "http://localhost:8080"}
+        self.req_args = {}
+
+        # create & connect to MCP server
+        # self.mcp_client = Client(**client_args)
+        # self.mcp_client.initialize()
+
+        # unitxt_config["process_docs"] = process_docs  # TODO figure out process_doc
+        self.contexts = None
+        self.context_ids = None
+
+        super().__init__(config)
+
+    def download(self, dataset_kwargs: Optional[Dict[str, Any]] = None) -> None:
+        assert_unitxt_installed()
+        from unitxt import load_dataset
+
+        dataset = load_dataset(self.DATASET_NAME, use_cache=True)
+
+        # TODO make call to MCP system to retrieve top k relevent docs per question
+
+        # TODO format contexts/ids appropriately to fields contexts and context_ids
+        #   (in unitxt RAG, self.dataset assumed to have input fields: question, question_id
+        #   and reference fields: reference_answers, is_answerable_label)
+        # self.contexts, self.context_ids = self.mcp_client.retrieve_contexts(dataset, **self.request_args)
+
+        self.dataset = dataset
+
+    def score(self, items, metric):
+        predictions, references = zip(*items)
+        assert_unitxt_installed()
+        from unitxt import evaluate
+
+        for reference in references:
+            reference["metrics"] = [metric]
+
+        # TODO format contexts/ids appropriately to fields contexts and context_ids and add to predictions
+        adjusted_predictions = []
+        for pred, ref in zip(predictions, references):
+            ref_dict = json.loads(ref["task_data"])
+            adjusted_predictions.append(
+                json.dumps(
+                    {
+                        "answer": pred,  # ref_dict["reference_answers"][0]
+                        "contexts": ref_dict["reference_contexts"]
+                        or [""],  # self.contexts or [""]
+                        "context_ids": ref_dict[
+                            "reference_context_ids"
+                        ],  # self.context_ids or []
+                    }
+                )
+            )
+        results = evaluate(adjusted_predictions, references)
+
+        return results[0]["score"]["global"]["score"]
