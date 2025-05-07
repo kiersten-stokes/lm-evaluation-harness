@@ -5,6 +5,7 @@ Addressing this need, we present Unitxt, an innovative library for customizable 
 """
 
 import importlib.util
+import json
 import re
 from collections.abc import Callable
 from functools import partial
@@ -44,17 +45,6 @@ def assert_unitxt_installed():
         )
 
 
-def score(items, metric):
-    predictions, references = zip(*items)
-    assert_unitxt_installed()
-    from unitxt import evaluate
-
-    for reference in references:
-        reference["metrics"] = [metric]
-    results = evaluate(predictions, references)
-    return results[0]["score"]["global"]["score"]
-
-
 class Unitxt(ConfigurableTask):
     VERSION = 0
 
@@ -65,12 +55,18 @@ class Unitxt(ConfigurableTask):
         if config is None:
             config = {}
         assert "recipe" in config, "Unitxt task must have a 'recipe' string."
-        super().__init__(
-            config={
-                "metadata": {"version": self.VERSION},
-                "dataset_name": config["recipe"],
-            }
-        )
+
+        unitxt_config = {
+            "metadata": {"version": self.VERSION},
+            "dataset_name": config["recipe"],
+        }
+
+        if config.get("process_docs"):
+            unitxt_config["process_docs"] = config.get("process_docs")
+        if config.get("process_results"):
+            unitxt_config["process_results"] = config.get("process_results")
+
+        super().__init__(config=unitxt_config)
         self.image_decoder = datasets.Image()
         self.metrics = self.dataset["test"][0]["metrics"]
 
@@ -176,6 +172,18 @@ class Unitxt(ConfigurableTask):
             for metric in self.metrics
         }
 
+    def score(self, items, metric):
+        predictions, references = zip(*items)
+        assert_unitxt_installed()
+        from unitxt import evaluate
+
+        for reference in references:
+            reference["metrics"] = [metric]
+
+        results = evaluate(predictions, references)
+
+        return results[0]["score"]["global"]["score"]
+
     def aggregation(self):
         """
         :returns: {str: [float] -> float}
@@ -183,7 +191,7 @@ class Unitxt(ConfigurableTask):
             functions that aggregate a list of metrics
         """
         return {
-            metric.replace("metrics.", ""): partial(score, metric=metric)
+            metric.replace("metrics.", ""): partial(self.score, metric=metric)
             for metric in self.metrics
         }
 
@@ -225,3 +233,107 @@ class UnitxtMultiModal(Unitxt):
 
     def get_arguments(self, doc, ctx):
         return (ctx, {"until": ["\n"]}, {"visual": self.doc_to_image(doc)})
+
+
+class UnitxtRAG(Unitxt):
+    def __init__(
+        self,
+        config: Optional[dict] = None,
+    ) -> None:
+        if config is None:
+            config = {}
+        assert config.get("rag"), "Not a RAG task"
+        # import MCP library
+        # parse args to get values
+        # client_args = {"endpoint": "http://localhost:8080"}
+
+        # create & connect to MCP server
+        # self.mcp_client = Client(**client_args)
+        # self.mcp_client.initialize()
+        # fail fast if any problems w/ above
+
+        self.contexts = None
+
+        super().__init__(config)
+
+        queries = [json.loads(data["task_data"])["question"] for data in self.eval_docs]
+        self.req_args = {"queries": queries}
+
+        # call MCP system to retrieve top k relevent docs per question & save results
+        # self.contexts = self.mcp_client.retrieve_contexts(dataset, **self.request_args)
+
+        contexts = [[json.loads(data["target"])["answer"]] for data in self.eval_docs]
+        context_ids = [
+            json.loads(data["references"][0])["context_ids"] for data in self.eval_docs
+        ]
+        self.contexts = list(zip(contexts, context_ids))
+
+    def test_docs(self):
+        if self.config.process_docs is not None and self.contexts is not None:
+            return self.config.process_docs(self.dataset["test"], self.contexts)
+        return self.dataset["test"]
+
+    def validation_docs(self):
+        if self.config.process_docs is not None and self.contexts is not None:
+            return self.config.process_docs(self.dataset["validation"], self.contexts)
+        return self.dataset["validation"]
+
+    def training_docs(self):
+        if self.config.process_docs is not None and self.contexts is not None:
+            return self.config.process_docs(self.dataset["train"], self.contexts)
+        return self.dataset["train"]
+
+    def fewshot_context(
+        self,
+        doc: str,
+        num_fewshot: int,
+        system_instruction: Optional[str] = None,
+        apply_chat_template: bool = False,
+        fewshot_as_multiturn: bool = False,
+        chat_template: Optional[Callable] = None,
+        gen_prefix: Optional[str] = None,
+    ) -> str:
+        source = self.doc_to_text(doc)
+        if isinstance(source, list):
+            if apply_chat_template:  # TODO better way to handle chat_template??
+                chat_history = [
+                    {
+                        "role": "user",
+                        "content": "Use the following context to inform your answer: "
+                        + " ".join(source),
+                    }
+                ]
+                formated_source = chat_template(chat_history)
+                return formated_source
+            else:
+                raise Exception(
+                    "Got chat template format from Unitxt, but apply_chat_template is false. Add '--apply_chat_template' to command line."
+                )
+        else:
+            return source
+
+    def process_results(self, doc, results):
+        """Take a single document and the LM results and evaluates, returning a
+        dict where keys are the names of submetrics and values are the values of
+        the metric for that one document
+
+        :param doc:
+            The document as returned from training_docs, validation_docs, or test_docs.
+        :param results:
+            The results of the requests created in construct_requests.
+        """
+        predictions, references = results[0], doc
+        if callable(self.config.process_results):
+            prediction = self.config.process_results(predictions, references)
+        else:
+            # Use the default `outputs` structure:
+            #  https://www.unitxt.ai/en/stable/docs/rag_support.html#rag-task-definition
+            prediction = {
+                "answer": predictions,
+                "contexts": references["source"],
+                "context_ids": references["source_ids"],
+            }
+
+        return {
+            metric.replace("metrics.", ""): (prediction, doc) for metric in self.metrics
+        }
