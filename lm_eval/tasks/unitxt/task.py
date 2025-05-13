@@ -4,6 +4,7 @@ In the dynamic landscape of generative NLP, traditional text processing pipeline
 Addressing this need, we present Unitxt, an innovative library for customizable textual data preparation and evaluation tailored to generative language models. Unitxt natively integrates with common libraries like HuggingFace and LM-eval-harness and deconstructs processing flows into modular components, enabling easy customization and sharing between practitioners. These components encompass model-specific formats, task prompts, and many other comprehensive dataset processing definitions. The Unitxt-Catalog centralizes these components, fostering collaboration and exploration in modern textual data workflows. Beyond being a tool, Unitxt is a community-driven platform, empowering users to build, share, and advance their pipelines collaboratively.
 """
 
+import asyncio
 import importlib.util
 import json
 import re
@@ -15,6 +16,7 @@ import datasets
 
 from lm_eval.api.instance import Instance
 from lm_eval.api.task import ConfigurableTask
+from lm_eval.utils import simple_parse_args_string
 
 
 _CITATION = """
@@ -242,27 +244,56 @@ class UnitxtRAG(Unitxt):
     ) -> None:
         if config is None:
             config = {}
-        assert config.get("rag"), "Not a RAG task"
-        # import MCP library
-        # parse args to get values
-        # client_args = {"endpoint": "http://localhost:8080"}
 
-        # create & connect to MCP server
-        # self.mcp_client = Client(**client_args)
-        # self.mcp_client.initialize()
-        # fail fast if any problems w/ above
+        assert (rag_args := config.get("rag")), "Not a RAG task"
+
+        assert (session_args := simple_parse_args_string(rag_args.get("session"))), (
+            "RAG task missing MCP session connection arguments"
+        )
+        session_args.pop("arg1")  # remove example values
+
+        assert (request_args := simple_parse_args_string(rag_args.get("request"))), (
+            "RAG task missing retrieval request arguments"
+        )
+        assert (tool := request_args.pop("tool")), (
+            "RAG task retrieval request arguments must include `tool` name"
+        )
+        assert (query_field := request_args.pop("query_field")), (
+            "RAG task retrieval request arguments must include `query_field` name"
+        )
+        # TODO do better error checking for correct formatting
 
         self.contexts = None
 
-        super().__init__(config)
+        super().__init__(config)  # will load dataset
 
         queries = [json.loads(data["task_data"])["question"] for data in self.eval_docs]
-        self.req_args = {"queries": queries}
+        # TODO add error checking to ensure the query structure is always the same
 
-        # call MCP system to retrieve top k relevent docs per question & save results
-        # self.contexts = self.mcp_client.retrieve_contexts(dataset, **self.request_args)
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
 
-        contexts = [[json.loads(data["target"])["answer"]] for data in self.eval_docs]
+        contexts = []
+
+        async def retrieve_contexts():
+            # Connect to a streamable HTTP server
+            async with streamablehttp_client(**session_args) as (
+                read_stream,
+                write_stream,
+                _,
+            ):
+                # Create a session using the client streams
+                async with ClientSession(read_stream, write_stream) as session:
+                    # Initialize connection
+                    await session.initialize()
+                    for query in queries:
+                        req_args = {query_field: query, **request_args}
+                        tool_result = await session.call_tool(tool, req_args)
+                        contexts.append([res.text for res in tool_result.content])
+
+        asyncio.run(retrieve_contexts())
+
+        # contexts = [[json.loads(data["target"])["answer"]] for data in self.eval_docs]  # workaround for testing
         context_ids = [
             json.loads(data["references"][0])["context_ids"] for data in self.eval_docs
         ]
