@@ -273,7 +273,7 @@ class UnitxtRAG(Unitxt):
         from mcp import ClientSession
         from mcp.client.streamable_http import streamablehttp_client
 
-        contexts = []
+        self.contexts = []
 
         async def retrieve_contexts():
             # Connect to a streamable HTTP server
@@ -289,15 +289,26 @@ class UnitxtRAG(Unitxt):
                     for query in queries:
                         req_args = {query_field: query, **request_args}
                         tool_result = await session.call_tool(tool, req_args)
-                        contexts.append([res.text for res in tool_result.content])
+                        contexts = [
+                            item
+                            for sublist in [
+                                json.loads(res.text)["contexts"]
+                                for res in tool_result.content
+                            ]
+                            for item in sublist
+                        ]
+                        context_ids = [
+                            json.loads(res.text)["id"] for res in tool_result.content
+                        ]
+                        self.contexts.append((contexts, context_ids))
 
         asyncio.run(retrieve_contexts())
 
         # contexts = [[json.loads(data["target"])["answer"]] for data in self.eval_docs]  # workaround for testing
-        context_ids = [
-            json.loads(data["references"][0])["context_ids"] for data in self.eval_docs
-        ]
-        self.contexts = list(zip(contexts, context_ids))
+        # context_ids = [
+        #    json.loads(data["references"][0])["context_ids"] for data in self.eval_docs
+        # ]
+        # self.contexts = list(zip(contexts, context_ids))
 
     def test_docs(self):
         if self.config.process_docs is not None and self.contexts is not None:
