@@ -47,6 +47,23 @@ def assert_unitxt_installed():
         )
 
 
+def assert_mcp_installed():
+    if importlib.util.find_spec("mcp") is None:
+        raise Exception("Please install mcp via 'pip install mcp'")
+
+
+class UnitxtFactory:
+    def __init__(self, config: Optional[dict] = None) -> None:
+        pass
+
+    def __new__(cls, config):
+        if config.get("rag"):
+            config["class"] = UnitxtEnd2EndRAG
+            return UnitxtEnd2EndRAG(config)
+        config["class"] = Unitxt
+        return Unitxt(config)
+
+
 class Unitxt(ConfigurableTask):
     VERSION = 0
 
@@ -237,7 +254,7 @@ class UnitxtMultiModal(Unitxt):
         return (ctx, {"until": ["\n"]}, {"visual": self.doc_to_image(doc)})
 
 
-class UnitxtRAG(Unitxt):
+class UnitxtEnd2EndRAG(Unitxt):
     def __init__(
         self,
         config: Optional[dict] = None,
@@ -245,70 +262,79 @@ class UnitxtRAG(Unitxt):
         if config is None:
             config = {}
 
-        assert (rag_args := config.get("rag")), "Not a RAG task"
-
-        assert (session_args := simple_parse_args_string(rag_args.get("session"))), (
-            "RAG task missing MCP session connection arguments"
-        )
-        session_args.pop("arg1")  # remove example values
-
-        assert (request_args := simple_parse_args_string(rag_args.get("request"))), (
-            "RAG task missing retrieval request arguments"
-        )
-        assert (tool := request_args.pop("tool")), (
-            "RAG task retrieval request arguments must include `tool` name"
-        )
-        assert (query_field := request_args.pop("query_field")), (
-            "RAG task retrieval request arguments must include `query_field` name"
-        )
-        # TODO do better error checking for correct formatting
-
+        session_args, request_args = self.validate_rag_and_return(config)
         self.contexts = None
 
-        super().__init__(config)  # will load dataset
+        super().__init__(config)
 
-        queries = [json.loads(data["task_data"])["question"] for data in self.eval_docs]
-        # TODO add error checking to ensure the query structure is always the same
-
+        assert_mcp_installed()
         from mcp import ClientSession
         from mcp.client.streamable_http import streamablehttp_client
 
-        self.contexts = []
+        retrieved_contexts = []
 
         async def retrieve_contexts():
-            # Connect to a streamable HTTP server
             async with streamablehttp_client(**session_args) as (
                 read_stream,
                 write_stream,
                 _,
             ):
-                # Create a session using the client streams
                 async with ClientSession(read_stream, write_stream) as session:
-                    # Initialize connection
                     await session.initialize()
-                    for query in queries:
+                    tool_name = request_args.pop("tool")
+                    query_field = request_args.pop("query_field")
+                    context_field = request_args.pop("context_field")
+                    id_field = request_args.pop("id_field")
+
+                    for query in self.queries:
                         req_args = {query_field: query, **request_args}
-                        tool_result = await session.call_tool(tool, req_args)
+                        tool_result = await session.call_tool(tool_name, req_args)
                         contexts = [
                             item
                             for sublist in [
-                                json.loads(res.text)["contexts"]
+                                json.loads(res.text)[context_field]
                                 for res in tool_result.content
                             ]
                             for item in sublist
                         ]
                         context_ids = [
-                            json.loads(res.text)["id"] for res in tool_result.content
+                            json.loads(res.text)[id_field]
+                            for res in tool_result.content
                         ]
-                        self.contexts.append((contexts, context_ids))
+                        retrieved_contexts.append((contexts, context_ids))
 
         asyncio.run(retrieve_contexts())
 
-        # contexts = [[json.loads(data["target"])["answer"]] for data in self.eval_docs]  # workaround for testing
-        # context_ids = [
-        #    json.loads(data["references"][0])["context_ids"] for data in self.eval_docs
-        # ]
-        # self.contexts = list(zip(contexts, context_ids))
+        self.contexts = retrieved_contexts
+
+    @staticmethod
+    def validate_rag_and_return(config):
+        assert (rag_args := config.get("rag")), "Task yaml missing the 'rag' section"
+
+        assert (session_args := simple_parse_args_string(rag_args.get("session"))), (
+            "RAG task yaml missing 'session' section for MCP connection arguments"
+        )
+
+        assert (request_args := simple_parse_args_string(rag_args.get("request"))), (
+            "RAG task yaml missing 'request' section with retrieval arguments"
+        )
+        assert request_args.get("tool"), (
+            "RAG task retrieval request arguments must include 'tool' name"
+        )
+        assert request_args.get("query_field"), (
+            "RAG task retrieval request arguments must include 'query_field' name"
+        )
+        assert request_args.get("context_field"), (
+            "RAG task retrieval request arguments must include 'context_field' name"
+        )
+        assert request_args.get("id_field"), (
+            "RAG task retrieval request arguments must include 'id_field' name"
+        )
+        return session_args, request_args
+
+    @property
+    def queries(self):
+        return [json.loads(doc["task_data"])["question"] for doc in self.eval_docs]
 
     def test_docs(self):
         if self.config.process_docs is not None and self.contexts is not None:
@@ -337,8 +363,8 @@ class UnitxtRAG(Unitxt):
     ) -> str:
         source = self.doc_to_text(doc)
         if isinstance(source, list):
-            if apply_chat_template:  # TODO better way to handle chat_template??
-                chat_history = [
+            if apply_chat_template:
+                chat_history = [  # TODO make chat template configurable?
                     {
                         "role": "user",
                         "content": "Use the following context to inform your answer: "
