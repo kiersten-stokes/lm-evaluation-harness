@@ -120,7 +120,7 @@ class Unitxt(ConfigurableTask):
         return False
 
     def doc_to_target(self, doc):
-        doc["target"]
+        return doc["target"]
 
     def get_arguments(self, doc, ctx):
         return (ctx, {"until": ["\n"]})
@@ -135,8 +135,7 @@ class Unitxt(ConfigurableTask):
         chat_template: Optional[Callable] = None,
         gen_prefix: Optional[str] = None,
     ) -> str:
-        source = self.doc_to_text(doc)
-        if isinstance(source, list):
+        if isinstance(self.doc_to_text(doc), list):
             if apply_chat_template:
                 formated_source = chat_template(self.doc_to_text(doc))
                 return formated_source
@@ -145,7 +144,15 @@ class Unitxt(ConfigurableTask):
                     "Got chat template format from Unitxt, but apply_chat_template is false. Add '--apply_chat_template' to command line."
                 )
         else:
-            return source
+            return super().fewshot_context(
+                doc=doc,
+                num_fewshot=num_fewshot,
+                system_instruction=system_instruction,
+                apply_chat_template=apply_chat_template,
+                fewshot_as_multiturn=fewshot_as_multiturn,
+                chat_template=chat_template,
+                gen_prefix=gen_prefix,
+            )
 
     def construct_requests(self, doc, ctx, **kwargs):
         """Uses RequestFactory to construct Requests and returns an iterable of
@@ -351,34 +358,13 @@ class UnitxtEnd2EndRAG(Unitxt):
             return self.config.process_docs(self.dataset["train"], self.contexts)
         return self.dataset["train"]
 
-    def fewshot_context(
-        self,
-        doc: str,
-        num_fewshot: int,
-        system_instruction: Optional[str] = None,
-        apply_chat_template: bool = False,
-        fewshot_as_multiturn: bool = False,
-        chat_template: Optional[Callable] = None,
-        gen_prefix: Optional[str] = None,
-    ) -> str:
-        source = self.doc_to_text(doc)
-        if isinstance(source, list):
-            if apply_chat_template:
-                chat_history = [  # TODO make chat template configurable?
-                    {
-                        "role": "user",
-                        "content": "Use the following context to inform your answer: "
-                        + " ".join(source),
-                    }
-                ]
-                formated_source = chat_template(chat_history)
-                return formated_source
-            else:
-                raise Exception(
-                    "Got chat template format from Unitxt, but apply_chat_template is false. Add '--apply_chat_template' to command line."
-                )
-        else:
-            return source
+    def doc_to_text(self, doc):
+        contexts = doc.get("contexts", None)
+        if contexts is not None and isinstance(doc["contexts"], list):
+            return "Use the following context to inform your answer: " + " ".join(
+                contexts
+            )
+        return doc["source"]
 
     def process_results(self, doc, results):
         """Take a single document and the LM results and evaluates, returning a
@@ -394,12 +380,12 @@ class UnitxtEnd2EndRAG(Unitxt):
         if callable(self.config.process_results):
             prediction = self.config.process_results(predictions, references)
         else:
-            # Use the default `outputs` structure:
+            # Use the default Unitxt `outputs` structure:
             #  https://www.unitxt.ai/en/stable/docs/rag_support.html#rag-task-definition
             prediction = {
                 "answer": predictions,
-                "contexts": references["source"],
-                "context_ids": references["source_ids"],
+                "contexts": references["contexts"],
+                "context_ids": references["context_ids"],
             }
 
         return {

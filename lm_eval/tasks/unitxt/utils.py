@@ -7,7 +7,7 @@ def process_docs(
     dataset: datasets.Dataset, contexts: tuple[list[str]]
 ) -> datasets.Dataset:
     def _process_doc(doc, ctx):
-        out_doc = {**doc, "source": ctx[0], "source_ids": ctx[1]}
+        out_doc = {**doc, "contexts": ctx[0], "context_ids": ctx[1]}
         return out_doc
 
     return list(map(_process_doc, dataset, contexts))
@@ -16,7 +16,7 @@ def process_docs(
 def postprocess_docs(predictions, references):
     predictions_context = {
         "answer": predictions,
-        "contexts": references["source"],
-        "context_ids": references["source_ids"],
+        "contexts": references["contexts"],
+        "context_ids": references["context_ids"],
     }
     return json.dumps(predictions_context)
