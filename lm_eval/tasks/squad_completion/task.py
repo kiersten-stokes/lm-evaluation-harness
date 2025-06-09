@@ -15,6 +15,7 @@ class SQUADCompletion(ConfigurableTask):
 
     def __init__(self, **kwargs):
         super().__init__(config={"metadata": {"version": self.VERSION}})
+        print("hi")
 
     def has_training_docs(self):
         return False
