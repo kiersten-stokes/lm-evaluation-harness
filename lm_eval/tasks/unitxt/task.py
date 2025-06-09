@@ -47,9 +47,13 @@ def assert_unitxt_installed():
         )
 
 
-def assert_mcp_installed():
+def assert_rag_dependencies_installed():
     if importlib.util.find_spec("mcp") is None:
         raise Exception("Please install mcp via 'pip install mcp'")
+    if importlib.util.find_spec("jsonpath_ng") is None:
+        raise Exception(
+            "Please install jsonpath-ng package via 'pip install jsonpath-ng'"
+        )
 
 
 class UnitxtFactory:
@@ -269,12 +273,13 @@ class UnitxtEnd2EndRAG(Unitxt):
         if config is None:
             config = {}
 
-        session_args, request_args = self.validate_rag_and_return(config)
+        assert_rag_dependencies_installed()
+        session_args, request_args = self.validate_args_and_return(config)
         self.contexts = None
 
         super().__init__(config)
 
-        assert_mcp_installed()
+        from jsonpath_ng import parse
         from mcp import ClientSession
         from mcp.client.streamable_http import streamablehttp_client
 
@@ -288,25 +293,27 @@ class UnitxtEnd2EndRAG(Unitxt):
             ):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
+                    # await session.set_logging_level("debug")  # TODO make configurable
+
                     tool_name = request_args.pop("tool")
                     query_field = request_args.pop("query_field")
-                    context_field = request_args.pop("context_field")
-                    id_field = request_args.pop("id_field")
+
+                    context_field = f"[*].{request_args.pop('context_field')}"
+                    id_field = f"[*].{request_args.pop('id_field')}"
 
                     for query in self.queries:
                         req_args = {query_field: query, **request_args}
                         tool_result = await session.call_tool(tool_name, req_args)
+                        results = [
+                            json.loads(getattr(res, query_field))
+                            for res in tool_result.content
+                        ]
+
                         contexts = [
-                            item
-                            for sublist in [
-                                json.loads(res.text)[context_field]
-                                for res in tool_result.content
-                            ]
-                            for item in sublist
+                            match.value for match in parse(context_field).find(results)
                         ]
                         context_ids = [
-                            json.loads(res.text)[id_field]
-                            for res in tool_result.content
+                            match.value for match in parse(id_field).find(results)
                         ]
                         retrieved_contexts.append((contexts, context_ids))
 
@@ -315,13 +322,11 @@ class UnitxtEnd2EndRAG(Unitxt):
         self.contexts = retrieved_contexts
 
     @staticmethod
-    def validate_rag_and_return(config):
+    def validate_args_and_return(config):
         assert (rag_args := config.get("rag")), "Task yaml missing the 'rag' section"
-
         assert (session_args := simple_parse_args_string(rag_args.get("session"))), (
             "RAG task yaml missing 'session' section for MCP connection arguments"
         )
-
         assert (request_args := simple_parse_args_string(rag_args.get("request"))), (
             "RAG task yaml missing 'request' section with retrieval arguments"
         )
@@ -334,10 +339,28 @@ class UnitxtEnd2EndRAG(Unitxt):
         assert request_args.get("context_field"), (
             "RAG task retrieval request arguments must include 'context_field' name"
         )
+        assert UnitxtEnd2EndRAG.is_valid_jsonpath(request_args["context_field"]), (
+            "'context_field' must be a valid jsonpath value"
+        )
         assert request_args.get("id_field"), (
             "RAG task retrieval request arguments must include 'id_field' name"
         )
+        assert UnitxtEnd2EndRAG.is_valid_jsonpath(request_args["id_field"]), (
+            "'id_field' must be a valid jsonpath value"
+        )
+
         return session_args, request_args
+
+    @staticmethod
+    def is_valid_jsonpath(expression):
+        from jsonpath_ng import parse
+        from jsonpath_ng.exceptions import JsonPathParserError
+
+        try:
+            parse(expression)
+            return True
+        except JsonPathParserError:
+            return False
 
     @property
     def queries(self):
