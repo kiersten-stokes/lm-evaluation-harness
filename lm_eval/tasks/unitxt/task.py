@@ -4,7 +4,9 @@ In the dynamic landscape of generative NLP, traditional text processing pipeline
 Addressing this need, we present Unitxt, an innovative library for customizable textual data preparation and evaluation tailored to generative language models. Unitxt natively integrates with common libraries like HuggingFace and LM-eval-harness and deconstructs processing flows into modular components, enabling easy customization and sharing between practitioners. These components encompass model-specific formats, task prompts, and many other comprehensive dataset processing definitions. The Unitxt-Catalog centralizes these components, fostering collaboration and exploration in modern textual data workflows. Beyond being a tool, Unitxt is a community-driven platform, empowering users to build, share, and advance their pipelines collaboratively.
 """
 
+import asyncio
 import importlib.util
+import json
 import re
 from collections.abc import Callable
 from functools import partial
@@ -14,6 +16,7 @@ import datasets
 
 from lm_eval.api.instance import Instance
 from lm_eval.api.task import ConfigurableTask
+from lm_eval.utils import simple_parse_args_string
 
 
 _CITATION = """
@@ -44,15 +47,25 @@ def assert_unitxt_installed():
         )
 
 
-def score(items, metric):
-    predictions, references = zip(*items)
-    assert_unitxt_installed()
-    from unitxt import evaluate
+def assert_rag_dependencies_installed():
+    if importlib.util.find_spec("mcp") is None:
+        raise Exception("Please install mcp via 'pip install mcp'")
+    if importlib.util.find_spec("jsonpath_ng") is None:
+        raise Exception(
+            "Please install jsonpath-ng package via 'pip install jsonpath-ng'"
+        )
 
-    for reference in references:
-        reference["metrics"] = [metric]
-    results = evaluate(predictions, references)
-    return results[0]["score"]["global"]["score"]
+
+class UnitxtFactory:
+    def __init__(self, config: Optional[dict] = None) -> None:
+        pass
+
+    def __new__(cls, config):
+        if config.get("rag"):
+            config["class"] = UnitxtEnd2EndRAG
+            return UnitxtEnd2EndRAG(config)
+        config["class"] = Unitxt
+        return Unitxt(config)
 
 
 class Unitxt(ConfigurableTask):
@@ -65,12 +78,18 @@ class Unitxt(ConfigurableTask):
         if config is None:
             config = {}
         assert "recipe" in config, "Unitxt task must have a 'recipe' string."
-        super().__init__(
-            config={
-                "metadata": {"version": self.VERSION},
-                "dataset_name": config["recipe"],
-            }
-        )
+
+        unitxt_config = {
+            "metadata": {"version": self.VERSION},
+            "dataset_name": config["recipe"],
+        }
+
+        if config.get("process_docs"):
+            unitxt_config["process_docs"] = config.get("process_docs")
+        if config.get("process_results"):
+            unitxt_config["process_results"] = config.get("process_results")
+
+        super().__init__(config=unitxt_config)
         self.image_decoder = datasets.Image()
         self.metrics = self.dataset["test"][0]["metrics"]
 
@@ -183,6 +202,18 @@ class Unitxt(ConfigurableTask):
             for metric in self.metrics
         }
 
+    def score(self, items, metric):
+        predictions, references = zip(*items)
+        assert_unitxt_installed()
+        from unitxt import evaluate
+
+        for reference in references:
+            reference["metrics"] = [metric]
+
+        results = evaluate(predictions, references)
+
+        return results[0]["score"]["global"]["score"]
+
     def aggregation(self):
         """
         :returns: {str: [float] -> float}
@@ -190,7 +221,7 @@ class Unitxt(ConfigurableTask):
             functions that aggregate a list of metrics
         """
         return {
-            metric.replace("metrics.", ""): partial(score, metric=metric)
+            metric.replace("metrics.", ""): partial(self.score, metric=metric)
             for metric in self.metrics
         }
 
@@ -232,3 +263,154 @@ class UnitxtMultiModal(Unitxt):
 
     def get_arguments(self, doc, ctx):
         return (ctx, {"until": ["\n"]}, {"visual": self.doc_to_image(doc)})
+
+
+class UnitxtEnd2EndRAG(Unitxt):
+    def __init__(
+        self,
+        config: Optional[dict] = None,
+    ) -> None:
+        if config is None:
+            config = {}
+
+        assert_rag_dependencies_installed()
+        session_args, request_args = self.validate_args_and_return(config)
+        self.contexts = None
+
+        super().__init__(config)
+
+        from jsonpath_ng import parse
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        retrieved_contexts = []
+
+        async def retrieve_contexts():
+            async with streamablehttp_client(**session_args) as (
+                read_stream,
+                write_stream,
+                _,
+            ):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    # await session.set_logging_level("debug")  # TODO make configurable
+
+                    tool_name = request_args.pop("tool")
+                    query_field = request_args.pop("query_field")
+
+                    context_field = f"[*].{request_args.pop('context_field')}"
+                    id_field = f"[*].{request_args.pop('id_field')}"
+
+                    for query in self.queries:
+                        req_args = {query_field: query, **request_args}
+                        tool_result = await session.call_tool(tool_name, req_args)
+                        results = [
+                            json.loads(getattr(res, query_field))
+                            for res in tool_result.content
+                        ]
+
+                        contexts = [
+                            match.value for match in parse(context_field).find(results)
+                        ]
+                        context_ids = [
+                            match.value for match in parse(id_field).find(results)
+                        ]
+                        retrieved_contexts.append((contexts, context_ids))
+
+        asyncio.run(retrieve_contexts())
+
+        self.contexts = retrieved_contexts
+
+    @staticmethod
+    def validate_args_and_return(config):
+        assert (rag_args := config.get("rag")), "Task yaml missing the 'rag' section"
+        assert (session_args := simple_parse_args_string(rag_args.get("session"))), (
+            "RAG task yaml missing 'session' section for MCP connection arguments"
+        )
+        assert (request_args := simple_parse_args_string(rag_args.get("request"))), (
+            "RAG task yaml missing 'request' section with retrieval arguments"
+        )
+        assert request_args.get("tool"), (
+            "RAG task retrieval request arguments must include 'tool' name"
+        )
+        assert request_args.get("query_field"), (
+            "RAG task retrieval request arguments must include 'query_field' name"
+        )
+        assert request_args.get("context_field"), (
+            "RAG task retrieval request arguments must include 'context_field' name"
+        )
+        assert UnitxtEnd2EndRAG.is_valid_jsonpath(request_args["context_field"]), (
+            "'context_field' must be a valid jsonpath value"
+        )
+        assert request_args.get("id_field"), (
+            "RAG task retrieval request arguments must include 'id_field' name"
+        )
+        assert UnitxtEnd2EndRAG.is_valid_jsonpath(request_args["id_field"]), (
+            "'id_field' must be a valid jsonpath value"
+        )
+
+        return session_args, request_args
+
+    @staticmethod
+    def is_valid_jsonpath(expression):
+        from jsonpath_ng import parse
+        from jsonpath_ng.exceptions import JsonPathParserError
+
+        try:
+            parse(expression)
+            return True
+        except JsonPathParserError:
+            return False
+
+    @property
+    def queries(self):
+        return [json.loads(doc["task_data"])["question"] for doc in self.eval_docs]
+
+    def test_docs(self):
+        if self.config.process_docs is not None and self.contexts is not None:
+            return self.config.process_docs(self.dataset["test"], self.contexts)
+        return self.dataset["test"]
+
+    def validation_docs(self):
+        if self.config.process_docs is not None and self.contexts is not None:
+            return self.config.process_docs(self.dataset["validation"], self.contexts)
+        return self.dataset["validation"]
+
+    def training_docs(self):
+        if self.config.process_docs is not None and self.contexts is not None:
+            return self.config.process_docs(self.dataset["train"], self.contexts)
+        return self.dataset["train"]
+
+    def doc_to_text(self, doc):
+        contexts = doc.get("contexts", None)
+        if contexts is not None and isinstance(doc["contexts"], list):
+            return "Use the following context to inform your answer: " + " ".join(
+                contexts
+            )
+        return doc["source"]
+
+    def process_results(self, doc, results):
+        """Take a single document and the LM results and evaluates, returning a
+        dict where keys are the names of submetrics and values are the values of
+        the metric for that one document
+
+        :param doc:
+            The document as returned from training_docs, validation_docs, or test_docs.
+        :param results:
+            The results of the requests created in construct_requests.
+        """
+        predictions, references = results[0], doc
+        if callable(self.config.process_results):
+            prediction = self.config.process_results(predictions, references)
+        else:
+            # Use the default Unitxt `outputs` structure:
+            #  https://www.unitxt.ai/en/stable/docs/rag_support.html#rag-task-definition
+            prediction = {
+                "answer": predictions,
+                "contexts": references["contexts"],
+                "context_ids": references["context_ids"],
+            }
+
+        return {
+            metric.replace("metrics.", ""): (prediction, doc) for metric in self.metrics
+        }
